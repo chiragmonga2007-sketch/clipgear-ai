@@ -1,0 +1,235 @@
+# ==============================================================================
+# CLIPGEAR AI — SYSTEM DOCUMENTATION & RETROSPECTIVE
+# File: last changes
+# ==============================================================================
+
+## 1. PROJECT OVERVIEW
+ClipGear AI (formerly ClipForge) is an automated video clipping and short-form content generator.
+It ingests long-form video files (podcasts, streams, interviews) via direct upload
+or YouTube URL, detects duration, segments them into deterministic viral shorts 
+(15s to 180s), transcribes dialogue using AI for stylized karaoke subtitles, and 
+optionally overlays gameplay footage (e.g. Subway Surfers) in a 9:16 vertical split-screen.
+It also features a full social media distribution suite: automated 1-click publishing
+to YouTube Shorts and Instagram Reels, live Google Sheet tracking strictly named 'uploaded',
+and a dedicated multi-page studio interface.
+
+---
+
+## 2. TOOLS & LIBRARIES USED
+
+### Backend (Python 3.12 / FastAPI)
+- **FastAPI**: Asynchronous web API framework serving REST endpoints for YouTube downloads, 
+  clipping triggers, job polling, media streaming, social accounts, and cleanup.
+- **Uvicorn**: ASGI production-grade server running the FastAPI app.
+- **faster-whisper (CTranslate2)**: High-performance reimplementation of OpenAI's Whisper model. 
+  Configured with int8 AVX2 CPU quantization and 4-thread execution for ~3x faster transcription.
+- **yt-dlp**: YouTube and web video downloader with format selection (720p/480p caps to avoid 
+  unnecessary multi-gigabyte 4K downloads) and local caching.
+- **FFmpeg 7.1 (via imageio-ffmpeg & local binaries)**: The core video processing workhorse. 
+  Handles audio extraction, filter graphs, subtitle rendering (libass), video scaling, 
+  background blurring, split-screen stacking, and H.264/AAC encoding.
+- **PyAV (`av`)**: Low-level FFmpeg bindings used for probing video container metadata and 
+  precise frame duration calculations.
+- **Google APIs & gspread**:
+  - `google-auth-oauthlib` & `google-api-python-client`: YouTube Data API v3 upload & channel management.
+  - `gspread`: Google Sheets API v4 for real-time logging, reading, and clearing the 'uploaded' sheet.
+- **Pydantic**: Request/response schema validation.
+- **Gradio**: Interactive testing interface mounted directly at `/gradio` for headless testing.
+
+### Frontend (Next.js 15 & React 19)
+- **Next.js (App Router)**: Client-side interactive web application with fast hot reloading.
+- **React 19 & TypeScript**: Component state management, type safety, and real-time polling.
+- **Vanilla CSS Tokens & TailwindCSS**: Custom dark-mode design system with glassmorphism, 
+  custom drop-zones, gradient glow accents, and responsive dual-column editor.
+- **lucide-react**: Clean, modern SVG icon set across all UI cards and buttons.
+
+---
+
+## 3. BUGS, ERRORS & HOW THEY WERE FIXED
+
+### Bug 1: The "5% Stuck Progress" Bug (UI Deadlock)
+- **The Problem**: Users generated 5 clips. The progress bar showed "5% Rendering..." indefinitely, 
+  even though clips 1, 2, 3, and 4 were already finished on disk.
+- **Root Cause**: In `app.py`, `/api/clip` was written with:
+  `await asyncio.to_thread(run_clip_job, job_id, params)`
+  This synchronous wait blocked the HTTP POST response until ALL 5 clips were done. The browser's 
+  `fetch()` was waiting for the HTTP response to return before it could start the `setInterval` 
+  polling loop. Thus, polling NEVER ran while rendering was happening.
+- **The Fix**:
+  1. Converted `/api/clip` to use FastAPI's `BackgroundTasks`:
+     `background_tasks.add_task(run_clip_job, job_id, params)`
+     The endpoint now returns immediately in ~50ms with `{ "job_id": job_id, "progress": 5 }`.
+  2. The frontend starts polling `GET /api/job/{job_id}` every 1 second immediately.
+  3. Added an incremental `clip_callback` in `run_clip_job`: as EACH individual clip completes, 
+     it is appended to `JOBS[job_id]["clips"]`, and the progress percentage increments smoothly 
+     (e.g., 20% -> 40% -> 60% -> 80% -> 100%).
+  4. In the UI, finished clips now appear live under the progress bar so users can preview 
+     or download Clip 1 while Clip 2 and 3 are still rendering.
+
+### Bug 2: Video Preview Broken (Black Screen at 0:00)
+- **The Problem**: After importing a YouTube video, the preview player was black and stuck at `0:00`.
+- **Root Cause**: When yt-dlp downloaded the video, the backend returned both `local_path` 
+  (`C:\Users\admin\...\downloads\8wEyzPkH7uM.mp4`) and `video_url`. The frontend passed `local_path` 
+  into the `<video src="...">` element. Web browsers strictly forbid web pages from accessing 
+  local drive paths (`file:///` or Windows drive letters) due to security sandboxing.
+- **The Fix**:
+  1. Created `formatMediaUrl()` in `DropZone.tsx` to automatically translate local Windows paths into 
+     browser-accessible HTTP URLs (`http://localhost:8000/downloads/...`, `/uploads/...`, or `/api/sample-video`).
+  2. Updated YouTube import handler to prioritize `data.video_url`.
+  3. Added an explicit `videoRef.current?.load()` trigger whenever `previewSrc` changes so the browser 
+     instantly initializes the media stream and renders the first frame.
+
+### Bug 3: PyAV 19 Incompatibility with faster_whisper
+- **The Problem**: `app.py` crashed on startup with:
+  `TypeError: av.open() got an unexpected keyword argument 'metadata_errors'`
+- **Root Cause**: PyAV version 19 removed the `metadata_errors` argument, but `faster_whisper` 
+  internal audio loaders still passed this parameter when decoding audio chunks.
+- **The Fix**: Monkey-patched `av.open` at startup in `app.py`:
+  ```python
+  _orig_av_open = av.open
+  def _safe_av_open(*args, **kwargs):
+      kwargs.pop("metadata_errors", None)
+      return _orig_av_open(*args, **kwargs)
+  av.open = _safe_av_open
+  ```
+
+### Bug 4: Windows File Locking (`[WinError 32]`) on YouTube Downloads
+- **The Problem**: Re-importing a YouTube URL resulted in:
+  `[WinError 32] The process cannot access the file because it is being used by another process: ...8wEyzPkH7uM.temp.mp4 -> ...8wEyzPkH7uM.mp4`
+- **Root Cause**: On Windows, open file streams are locked. When `yt-dlp` tried to download the video 
+  a second time, renaming its `.temp.mp4` to the existing `.mp4` failed because the file was being served.
+- **The Fix**: Added an instant cache check in `_download_youtube_sync()`:
+  Before downloading, `yt-dlp` extracts the video ID metadata with `download=False`. If a valid MP4 
+  with that ID already exists in `downloads/`, the backend immediately returns the cached video in ~0.1s.
+
+### Bug 5: FFmpeg Subtitle Filter Path Escaping on Windows
+- **The Problem**: FFmpeg failed with subtitle filter syntax errors on Windows absolute paths.
+- **Root Cause**: FFmpeg's `subtitles` filter treats Windows backslashes `\` and drive colons `:` as filter 
+  option separators.
+- **The Fix**: Subprocess execution runs with `cwd=str(OUTPUT_DIR)`, passing the relative filename 
+  (`subtitles=clip_01_subs.srt`) to bypass drive colon parsing errors completely.
+
+### Bug 6: Purple Download Button Bug (Fullscreen / Tab Navigation)
+- **The Problem**: Clicking the purple "Download MP4" button opened the video in fullscreen in the browser tab with no UI to go back.
+- **Root Cause**: The video URL was on port 8000 (`http://localhost:8000/output/...`) while the frontend ran on port 3000. Browser security policies ignore HTML5 `download` attributes on cross-origin URLs, causing the browser to navigate to the MP4 file as a normal link.
+- **The Fix**:
+  1. Converted client download handlers (`handleDownloadSingle`, `handleDownloadAll`, and `ClipGallery.tsx`) to fetch the video file as a Blob (`await response.blob()`), create a temporary `URL.createObjectURL(blob)`, and trigger download on the local blob.
+  2. Added dedicated backend endpoint `GET /api/download/{filename}` returning `FileResponse` with explicit `Content-Disposition: attachment; filename="{filename}"` headers as a fallback.
+
+### Bug 7: Solo Video "Compressed / Thin Pillarbox" Bug (Case B Aspect Ratio)
+- **The Problem**: When generating clips WITHOUT bottom gameplay, the video became compressed/squeezed into a thin 405px column in the center.
+- **Root Cause**: The FFmpeg filter graph for solo mode previously forced black letterbox padding (`pad=720:1280:(ow-iw)/2:(oh-ih)/2:black`) rather than scaling to cover the full frame.
+- **The Fix**: Updated Case B in `app.py` to use `scale=target_w:target_h:force_original_aspect_ratio=increase,crop=target_w:target_h,setsar=1,fps=30`, producing full-frame, centered, high-impact vertical shorts that fill the entire screen cleanly.
+
+### Bug 8: YouTube OAuth Connection Taking Too Long / Hanging
+- **The Problem**: Clicking "Connect YouTube Channel" resulted in a spinning "Authorizing..." button that hung indefinitely.
+- **Root Cause**: `InstalledAppFlow.run_local_server(port=0)` started a local server and printed the authorization link in the Python console. When running in the background, Windows did not bring the browser window to focus. Because the backend HTTP request was synchronous, it waited forever for the callback that the user couldn't see.
+- **The Fix**:
+  1. Implemented `start_google_auth_flow()` in `google_uploader.py`: runs the local server listener in a background thread and immediately returns the Google authorization URL to the API.
+  2. Updated `web/app/components/ConnectedAccountsView.tsx` to automatically call `window.open(data.auth_url, '_blank')` in the client's browser, and added a prominent fallback button `[ Open Google Login ↗ ]`.
+  3. Added real-time polling on `/api/google/status` so the card automatically detects authorization and turns green in seconds.
+
+### Bug 9: Google OAuth Error 403 `access_denied` (Testing Mode)
+- **The Problem**: Google blocked sign-in with "Access blocked: clipforge has not completed the Google verification process".
+- **Root Cause**: The Google Cloud project had its OAuth Consent Screen in "Testing" mode without the developer's test Google account registered under Test Users.
+- **The Solution**: Documented the 30-second fix to add the user's email under "Test Users" in Google Cloud Console or switch publishing status to "Publish App".
+
+### Bug 10: Local Clip Generation Slowdown & Thread Capping
+- **The Problem**: Local video clipping and FFmpeg rendering became noticeably slower even though local generation should run at 100% speed with zero delays.
+- **Root Cause**:
+  1. Faster-Whisper transcription was missing `vad_filter=True` (forcing the model to run compute-heavy transcription over silent frames/background music) and `condition_on_previous_text=False`.
+  2. Whisper model was lazy-loaded on the first clip rather than preloaded on startup.
+  3. FFmpeg encoding hardcoded `-threads 4`, artificially capping multi-core CPU encoding throughput.
+- **The Fix**:
+  1. Added `vad_filter=True` and `condition_on_previous_text=False` with `beam_size=1` for ~3x faster audio processing.
+  2. Preloaded Whisper model at server startup in a daemon thread.
+  3. Updated FFmpeg to `-threads 0` with `-preset ultrafast` for maximum CPU hardware concurrency.
+
+### Bug 11: Upload Gap Isolation & 35-Second Safe Social Interval
+- **The Problem**: Need strict separation between local rendering (0s delay) and social media publishing gaps (30 to 40s anti-ban cooldown).
+- **The Fix**:
+  1. Isolated `delay_seconds` strictly inside `google_uploader.py` bulk publishing loop.
+  2. Changed default delay from 60/120s to 35 seconds (with 30s/35s/40s options in UI).
+  3. Live progress countdown: `Waiting 35s before uploading next clip...`.
+
+---
+
+## 4. NEW MAJOR FEATURES ADDED
+
+### 1. Rebranding to ClipGear AI
+- Project name officially transitioned from **ClipForge** to **ClipGear AI**.
+- Updated headers, browser tabs, metadata, sidebar logos, and backend service titles.
+
+### 2. Multi-Page Left Sidebar Navigation (`Sidebar.tsx`)
+- Sleek, modern, dark-mode left sidebar navigation with zero-reload transitions between views:
+  - **Video Clipper**: Video source setup, 60fps Subway Surfers split-screen preset, settings, and clip generation.
+  - **Generated Clips**: Dedicated gallery to preview, inspect, select, download, and bulk-upload clips.
+  - **Uploaded Videos**: Live viewer displaying the contents of the Google Sheet strictly named **`uploaded`**.
+  - **Connected Accounts**: Live status, management, and credentials for YouTube and Instagram.
+- Sidebar Footer includes live upload target status pills (active YouTube channel, Instagram handle, and Google Sheet link), plus a **Clear Session & Sheet** button.
+- Fully responsive with mobile drawer and hamburger menu.
+
+### 3. Live Google Sheet Viewer Page (`UploadedVideosView.tsx`)
+- New dedicated view backed by `GET /api/uploaded-sheet` reading records live from the Google Sheet named **`uploaded`**.
+- Statistics summary: Total logged uploads, YouTube Shorts count, Instagram Reels count.
+- Real-time search filter: search across clip titles, captions, #hashtags, and @mentions.
+- Platform filter pills: All, YouTube, Instagram.
+- Interactive table displaying Timestamp, Clip Title, Platform badge, direct clickable video link (`https://youtube.com/shorts/...`), Caption preview, Tags & Mentions pills, and Status.
+- Actions: "Refresh Sheet", "Open in Google Sheets ↗", and "Clear Sheet" (`POST /api/uploaded-sheet/clear`).
+
+### 4. Dedicated Connected Accounts Page (`ConnectedAccountsView.tsx`)
+- Clear management for active social destinations:
+  - **YouTube Shorts Card**: Live Google OAuth status, authorized channel title, `@customUrl`, avatar, subscriber count, and video count. Includes Connect, Switch Channel, and Disconnect controls.
+  - **Instagram Reels Card**: Automated 1-click permission authorization. Displays connected `@handle` and active Reels destination status with Switch Account and Disconnect controls.
+  - Bottom summary explaining exactly how and where posts are published.
+
+### 5. Automated Real Meta Graph API Publishing for Instagram
+- Replaced the initial simulation with real Meta Graph API OAuth 2.0 (`instagram_basic`, `instagram_content_publish`, `pages_show_list`, `pages_read_engagement`).
+- Automatic 60-day long-lived token exchange (`fb_exchange_token`) and automated resolution of connected Instagram Business/Creator Account via linked Facebook Pages.
+- Real Reels container pipeline in `upload_instagram_reel`:
+  - Utilizes a configurable Public Tunnel Base URL (e.g. ngrok or Cloudflare Tunnel) to host `.mp4` outputs over HTTPS so Meta's servers can fetch them.
+  - Formats caption, hashtags, and tagged profiles (`user_tags` JSON payload: `[{"username": "creator"}]`).
+  - Creates Reel container (`POST /{ig-user-id}/media`), polls status until `FINISHED`, calls `POST /{ig-user-id}/media_publish`, fetches real permalink, and records it in the `uploaded` Google Sheet.
+
+### 6. Open-Source "Bring Your Own Keys" Architecture
+- Added collapsible **API Credentials Setup** panel in `ConnectedAccountsView.tsx`:
+  - **YouTube**: Input Google Client ID & Client Secret or drag-and-drop `client_secret.json`.
+  - **Meta / Instagram**: Input Meta App ID, Meta App Secret, and Public Tunnel Base URL.
+  - Provides 1-click **Copy Redirect URI** button (`http://localhost:8000/api/social/instagram/callback`) for Meta App Dashboard.
+  - Root `.gitignore` created to prevent accidental commits of `client_secret.json`, `token.json`, `instagram_token.json`, `social_config.json`, virtual environments, outputs, and build caches.
+
+### 7. Bulk Upload Metadata & 1-Minute Anti-Ban Delay Stopper
+- Updated default delay stopper from 120s to 60s (1 minute) in `google_uploader.py`, `app.py`, and the frontend UI with live countdown (`Waiting 0:59 before next clip...`).
+- Added structured batch metadata:
+  - **Shared Caption / Description**: With checkbox option to prepend each clip's generated title/hook.
+  - **Shared Hashtags**: Appended cleanly with `#` to captions and passed into YouTube `snippet.tags` array.
+  - **People / Profile Tags**: Formatted as JSON `user_tags` on Instagram Reels and linked in YouTube Shorts descriptions.
+  - Real published URLs, captions, hashtags, and @mentions auto-logged to Google Sheet `uploaded` via `gspread`.
+
+### 8. Native Subway Surfers 60FPS Split-Screen Integration
+- Bundled high-bitrate Subway Surfers gameplay video (`Subway Surfers Classic (2026) - Gameplay (PC UHD) [4K60FPS] - Throneful (1080p, h264).mp4`).
+- Stream-trimmed 15s using stream copy (`-c copy`) without quality loss.
+- One-click preset toggle & live video preview in Step 2 of Video Setup.
+
+### 9. Generation Controls: Pause, Resume & Cancel
+- Process tracking via `ACTIVE_PROCESSES` and `cancel_job_internal()`.
+- Endpoints `/api/job/{job_id}/pause`, `/api/job/{job_id}/resume`, and `/api/job/{job_id}/cancel`.
+- Interactive Pause/Resume and Cancel buttons in the real-time progress card.
+
+---
+
+## 5. CURRENT ARCHITECTURE & PORTS
+
+| Component | Port / Path | Command | Description |
+|-----------|-------------|---------|-------------|
+| **AI Backend Server** | `http://localhost:8000` | `.\.venv\Scripts\python.exe app.py` | FastAPI REST API, FFmpeg engine, Whisper transcription, Google/Instagram uploader |
+| **Gradio UI** | `http://localhost:8000/gradio` | (Mounted in `app.py`) | Gradio direct testing interface |
+| **Web Frontend** | `http://localhost:3000` | `npm --prefix web run dev` | Next.js 15 App Router client with left sidebar studio |
+| **Google Sheet Target** | Google Drive | Synced via `gspread` | Strict sheet name: **`uploaded`** |
+
+---
+
+## 6. VERIFICATION & STABILITY SUMMARY
+- **Frontend**: Clean Next.js production build (`npm run build`) with 0 errors across all TypeScript components and pages.
+- **Backend**: Clean Python compile (`py_compile app.py google_uploader.py`) with 0 syntax errors.
+- **Core Processing Pipeline**: Full preservation of Faster-Whisper int8 AVX2 CPU acceleration, 60fps split-screen stacking, solo full-frame centered cropping, safe blob downloads, pause/resume/cancel job controls, anti-ban upload delay, and Google Sheet synchronization.

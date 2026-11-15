@@ -1,0 +1,30 @@
+========================================
+HOW TO START THE CLIPGEAR WEB APP
+========================================
+
+The app consists of two parts: the Python AI Backend and the Next.js Web Frontend.
+
+---
+STEP 1: Start the AI Backend Server
+---
+Open PowerShell in the project root and run:
+    .\.venv\Scripts\python.exe app.py
+
+When you see:
+    INFO: Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+The backend is READY and running! (Do not close this terminal, it must stay running).
+
+You can also directly test the Gradio interface at:
+    http://localhost:8000/gradio
+    
+
+---
+STEP 2: Start the Next.js Web Frontend
+---
+Open a SECOND terminal window or tab and run:
+    cd web
+    npm run dev
+
+Once started, open your web browser and go to:
+    http://localhost:3000
+========================================
